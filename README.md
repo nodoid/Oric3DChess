@@ -12,4 +12,4 @@ Given the limitations of the machine (1MHz 6502 processor and 37K of available m
 
 You will need cc65 and an emulator to run this on (though you may be able to run this on a real machine using one of those SD card things you can find on eBay)
 
-The game is written in C with some 6502 assembler in there to speed things up
+The game is written in C
