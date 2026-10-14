@@ -1,0 +1,9 @@
+# everything outside src/, tests/, oric.cfg is tooling or generated
+build/
+tmp/
+docs/
+tools/
+refs/
+*.o
+bin/
+obj/
