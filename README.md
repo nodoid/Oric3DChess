@@ -11,3 +11,5 @@ My little sister loves chess so I thought, why not write one myself. The problem
 Given the limitations of the machine (1MHz 6502 processor and 37K of available memory), getting this in and having a game that plays at something approaching vaguely reasonable is actually really good.
 
 You will need cc65 and an emulator to run this on (though you may be able to run this on a real machine using one of those SD card things you can find on eBay)
+
+The game is written in C with some 6502 assembler in there to speed things up
