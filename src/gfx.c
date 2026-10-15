@@ -52,6 +52,36 @@ void project(int x, int y, int z)
 static unsigned char div6[SW];
 static unsigned char bit6[SW];
 
+/* 6*c for column c (avoids a multiply in span edge maths) */
+static const unsigned char mul6[40] = {
+    0, 6, 12, 18, 24, 30, 36, 42, 48, 54,
+    60, 66, 72, 78, 84, 90, 96, 102, 108, 114,
+    120, 126, 132, 138, 144, 150, 156, 162, 168, 174,
+    180, 186, 192, 198, 204, 210, 216, 222, 228, 234
+};
+
+/* Single-pixel ops are macros: as functions each call cost ~150 cycles
+ * of cc65 soft-stack argument shuffling, and gfx_line/gfx_text call
+ * them once per pixel (the trace showed ~47% of init time inside the
+ * cc65 runtime helpers).  Args are always side-effect-free here. */
+#define gfx_px(x, y)                                                         \
+    do {                                                                     \
+        int gx_ = (int)(x), gy_ = (int)(y);                                 \
+        if ((unsigned)gx_ < SW && (unsigned)gy_ < SH) {                      \
+            unsigned char *gp_ = SCR + gy_ * 40 + div6[gx_];                \
+            *gp_ = (unsigned char)((*gp_ | 0x40) | bit6[gx_]);              \
+        }                                                                    \
+    } while (0)
+
+#define gfx_clrp(x, y)                                                       \
+    do {                                                                     \
+        int gx_ = (int)(x), gy_ = (int)(y);                                 \
+        if ((unsigned)gx_ < SW && (unsigned)gy_ < SH) {                      \
+            unsigned char *gp_ = SCR + gy_ * 40 + div6[gx_];                \
+            *gp_ = (unsigned char)(*gp_ & (unsigned char)~bit6[gx_]);        \
+        }                                                                    \
+    } while (0)
+
 void gfx_clear(void)
 {
     unsigned char *p = SCR;
@@ -106,29 +136,11 @@ void gfx_init(void)
     }
 }
 
-void gfx_px(int x, int y)
-{
-    unsigned char *p;
-
-    if ((unsigned int)x >= SW || (unsigned int)y >= SH)
-        return;
-    p = SCR + y * 40 + div6[x];
-    *p = (unsigned char)((*p | 0x40) | bit6[x]);
-}
-
-void gfx_clrp(int x, int y)
-{
-    unsigned char *p;
-
-    if ((unsigned int)x >= SW || (unsigned int)y >= SH)
-        return;
-    p = SCR + y * 40 + div6[x];
-    *p = (unsigned char)(*p & (unsigned char)~bit6[x]);
-}
-
 void gfx_span(int x0, int x1, int y, unsigned char mode)
 {
-    int c, c0, c1;
+    int c0, c1;
+    unsigned char *p;
+    unsigned char full, dot = 0;
 
     if (y < 0 || y >= SH)
         return;
@@ -138,72 +150,119 @@ void gfx_span(int x0, int x1, int y, unsigned char mode)
         x1 = SW - 1;
     if (x0 > x1)
         return;
+    if (mode == FILL_NONE)
+        return;
+
+    c0 = div6[x0];
+    c1 = div6[x1];
+    p = SCR + y * 40 + c0;
 
     if (mode == FILL_D50 || mode == FILL_D25) {
-        for (c = x0; c <= x1; ++c) {
-            unsigned char on;
-            if (mode == FILL_D50)
-                on = (unsigned char)(((c ^ y) & 1) != 0);
-            else
-                on = (unsigned char)((c & 1) == 0 && (y & 1) == 0);
-            if (on)
-                gfx_px(c, y);
-            else
-                gfx_clrp(c, y);
-        }
+        /* Dither bytewise: 6*col is even, so pixel i in a byte has the
+           same column parity as i; the dot pattern depends only on
+           y&1.  new = (old & ~span) | (dot & span): on-dots set,
+           off-dots cleared, pixels outside the span untouched. */
+        static const unsigned char dith[2] = { 0x15, 0x2A }; /* D50 */
+        static const unsigned char dith25[2] = { 0x2A, 0x00 };
+        dot = (mode == FILL_D50) ? dith[y & 1] : dith25[y & 1];
+        full = (unsigned char)(0x40 | (dot & 0x3F));
+    } else if (mode == FILL_W) {
+        full = 0x7F;                       /* 6 pixels on, bit6 set   */
+    } else {
+        full = 0x40;                       /* all pixels off          */
+    }
+
+    /* Interior bytes are whole: store a constant.  Only the (at most
+       two) edge bytes need per-pixel mask maths - that loop used to
+       run for every byte of every scanline and dominated the render. */
+    if (c0 == c1) {
+        int lo = x0 - mul6[c0], hi = x1 - mul6[c0];
+        unsigned char m = (unsigned char)((0xFF << (5 - hi)) &
+                                          (0xFF >> (2 + lo)));
+
+        if (mode == FILL_W)
+            *p = (unsigned char)((*p | 0x40) | m);
+        else if (mode == FILL_B)
+            *p = (unsigned char)(*p & (unsigned char)~m);
+        else
+            *p = (unsigned char)(((*p | 0x40) & (unsigned char)~m) |
+                                 (unsigned char)(dot & m));
         return;
     }
-    if (mode == FILL_NONE || mode == FILL_D50)
-        return;
 
-    c0 = x0 / 6;
-    c1 = x1 / 6;
+    /* first byte: spans never end before it, so hi is unclipped */
     {
-        unsigned char *p = SCR + y * 40 + c0;
-        for (c = c0; c <= c1; ++c, ++p) {
-            int lo = c * 6;
-            int hi = c * 6 + 5;
-            unsigned char m;
+        unsigned char m = (unsigned char)(0xFF >> (2 + x0 - mul6[c0]));
 
-            if (lo < x0)
-                lo = x0;
-            if (hi > x1)
-                hi = x1;
-            m = (unsigned char)((0xFF << (5 - (hi - c * 6))) &
-                                (0xFF >> (2 + (lo - c * 6))));
-            if (mode == FILL_W)
-                *p = (unsigned char)((*p | 0x40) | m);
-            else
-                *p = (unsigned char)(*p & (unsigned char)~m);
-        }
+        if (mode == FILL_W)
+            *p = (unsigned char)((*p | 0x40) | m);
+        else if (mode == FILL_B)
+            *p = (unsigned char)(*p & (unsigned char)~m);
+        else
+            *p = (unsigned char)(((*p | 0x40) & (unsigned char)~m) |
+                                 (unsigned char)(dot & m));
+        ++p;
+    }
+    for (c0 = c0 + 1; c0 < c1; ++c0)
+        *p++ = full;
+    /* last byte: lo is unclipped */
+    {
+        unsigned char m = (unsigned char)((0xFF << (5 - (x1 - mul6[c1]))) &
+                                          0x3F);
+
+        if (mode == FILL_W)
+            *p = (unsigned char)((*p | 0x40) | m);
+        else if (mode == FILL_B)
+            *p = (unsigned char)(*p & (unsigned char)~m);
+        else
+            *p = (unsigned char)(((*p | 0x40) & (unsigned char)~m) |
+                                 (unsigned char)(dot & m));
     }
 }
 
 void gfx_line(int x0, int y0, int x1, int y1, unsigned char color)
 {
-    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
-    int dy = y1 > y0 ? y0 - y1 : y1 - y0; /* negative */
-    int sx = x0 < x1 ? 1 : -1;
-    int sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
+    /* Hot-loop variables live in statics, not soft-stack locals: cc65
+       costs ~40 cycles per local access ((sp),y) versus ~10 for an
+       absolute address, and the trace showed gfx_line at ~18% of the
+       whole render.  The row base pointer replaces the per-pixel
+       y*40 multiply (a tosmula0 call, ~250 cycles each).  Not
+       reentrant - the renderer never is. */
+    static int sx0, sy0, sx1, sy1, serr, sdx, sdy, ssx, ssy, rstep;
+    static unsigned char *row;
+    int e2;
+
+    sx0 = x0; sy0 = y0; sx1 = x1; sy1 = y1;
+
+    sdx = x1 > x0 ? x1 - x0 : x0 - x1;
+    sdy = y1 > y0 ? y0 - y1 : y1 - y0; /* negative */
+    ssx = x0 < x1 ? 1 : -1;
+    ssy = y0 < y1 ? 1 : -1;
+    serr = sdx + sdy;
+    row = SCR + (int)(sy0 * 40);
+    rstep = ssy > 0 ? 40 : -40;
 
     for (;;) {
-        int e2;
+        if ((unsigned)sx0 < SW && (unsigned)sy0 < SH) {
+            unsigned char *p = row + div6[sx0];
+            unsigned char b = bit6[sx0];
 
-        if (color)
-            gfx_px(x0, y0);
-        else
-            gfx_clrp(x0, y0);
-        if (x0 == x1 && y0 == y1)
-            break;
-        e2 = err << 1;
-        if (e2 >= dy) {
-            err += dy;
-            x0 += sx;
+            if (color)
+                *p = (unsigned char)((*p | 0x40) | b);
+            else
+                *p = (unsigned char)(*p & (unsigned char)~b);
         }
-        if (e2 <= dx) {
-            err += dx;
-            y0 += sy;
+        if (sx0 == sx1 && sy0 == sy1)
+            break;
+        e2 = serr << 1;
+        if (e2 >= sdy) {
+            serr += sdy;
+            sx0 += ssx;
+        }
+        if (e2 <= sdx) {
+            serr += sdx;
+            sy0 += ssy;
+            row += rstep;
         }
     }
 }
@@ -245,41 +304,58 @@ void gfx_text(int x, int y, const char *s, unsigned char color)
 /* convex polygon fill (edge walking DDA)                              */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    long x;    /* 16.16 */
-    long dx;   /* 16.16 per scanline */
+    int x;     /* crossing at the current scanline          */
+    int dx;    /* whole pixels of advance per scanline      */
+    int rem;   /* fixed remainder numerator (sign of slope) */
+    int acc;   /* accumulated remainder, folds into x       */
+    int den;   /* |dy|, fold threshold                      */
     int ys, ye;
-} Edge;
+} Edge; /* walked by pointer, never indexed (i*14 would call
+           the 250-cycle tosmula0 helper for every edge row) */
+
+static Edge pedges[8];
+static int pcross[8];
 
 void poly_fill(const int *xs, const int *ys, unsigned char n,
               unsigned char mode)
 {
-    Edge edges[8];
     unsigned char ne = 0;
     unsigned char i;
     int miny = 32767, maxy = -32767;
     int y;
-    int cross[8];
 
     if (mode == FILL_NONE)
         return;
 
     for (i = 0; i < n; ++i) {
-        unsigned char j = (unsigned char)((i + 1) % n);
-        int ax = xs[i], ay = ys[i], bx = xs[j], by = ys[j];
+        unsigned char j = (unsigned char)(i + 1);
+        int ax, ay, bx, by, num, dy, q;
 
+        if (j == n)
+            j = 0;                     /* wrap: no costly % operator */
+        ax = xs[i]; ay = ys[i]; bx = xs[j]; by = ys[j];
         if (ay == by)
             continue;
         if (ay < by) {
-            edges[ne].ys = ay;
-            edges[ne].ye = by;
-            edges[ne].x = (long)ax << 16;
-            edges[ne].dx = ((long)(bx - ax) << 16) / (by - ay);
+            pedges[ne].ys = ay;
+            pedges[ne].ye = by;
+            pedges[ne].x = ax;
+            num = bx - ax;
+            dy = by - ay;
         } else {
-            edges[ne].ys = by;
-            edges[ne].ye = ay;
-            edges[ne].x = (long)bx << 16;
-            edges[ne].dx = ((long)(ax - bx) << 16) / (ay - by);
+            pedges[ne].ys = by;
+            pedges[ne].ye = ay;
+            pedges[ne].x = bx;
+            num = ax - bx;
+            dy = ay - by;
         }
+        /* Exact rational DDA: one 16-bit division replaces the old
+           32.16 long division ((num<<16)/dy) that ran per edge. */
+        q = num / dy;
+        pedges[ne].dx = q;
+        pedges[ne].rem = num - q * dy;   /* num % dy, without a mod */
+        pedges[ne].acc = 0;
+        pedges[ne].den = dy;
         ++ne;
         if (ay < miny)
             miny = ay;
@@ -299,25 +375,35 @@ void poly_fill(const int *xs, const int *ys, unsigned char n,
 
     for (y = miny; y <= maxy; ++y) {
         unsigned char nc = 0, a, b;
+        Edge *e = pedges;
+        Edge *eend = pedges + ne;
 
-        for (i = 0; i < ne; ++i) {
-            if (edges[i].ys <= y && y < edges[i].ye) {
-                cross[nc++] = (int)(edges[i].x >> 16);
-                edges[i].x += edges[i].dx;
+        for (; e < eend; ++e) {
+            if (y < e->ys || y >= e->ye)
+                continue;
+            pcross[nc++] = e->x;
+            e->x += e->dx;
+            e->acc += e->rem;
+            if (e->acc >= e->den) {
+                ++e->x;
+                e->acc -= e->den;
+            } else if (e->acc <= -e->den) {
+                --e->x;
+                e->acc += e->den;
             }
         }
         /* insertion sort, tiny n */
         for (a = 1; a < nc; ++a) {
-            int key = cross[a];
+            int key = pcross[a];
             b = (unsigned char)a;
-            while (b > 0 && cross[b - 1] > key) {
-                cross[b] = cross[b - 1];
+            while (b > 0 && pcross[b - 1] > key) {
+                pcross[b] = pcross[b - 1];
                 --b;
             }
-            cross[b] = key;
+            pcross[b] = key;
         }
         for (i = 0; i + 1 < nc; i = (unsigned char)(i + 2))
-            gfx_span(cross[i], cross[i + 1], y, mode);
+            gfx_span(pcross[i], pcross[i + 1], y, mode);
     }
 }
 
@@ -328,6 +414,7 @@ int grid_x[81];
 int grid_y[81];
 int grid_z[81];
 int vx[72], vy[72], vz[72]; /* projected piece verts */
+static int fdepth[68];       /* per-face depth, precomputed for sorting */
 
 static const signed char face_fill[2][3] = {
     /* white piece */ { FILL_W, FILL_D50, FILL_NONE },
@@ -367,15 +454,19 @@ void draw_piece(unsigned char f, unsigned char r, unsigned char pc)
         vz[i] = prj_z;
     }
 
-    /* order faces far -> near (painter's algorithm); larger z = farther */
-    for (i = 0; i < nf; ++i)
+    /* order faces far -> near (painter's algorithm); larger z = farther.
+       Depth is computed once per face: face_depth() divides, and the old
+       code called it on every insertion-sort comparison. */
+    for (i = 0; i < nf; ++i) {
+        fdepth[i] = face_depth(m, i);
         order[i] = i;
+    }
     for (i = 1; i < nf; ++i) {
         unsigned char key = order[i];
-        int kz = face_depth(m, key);
+        int kz = fdepth[key];
         int s = (int)i - 1;
 
-        while (s >= 0 && face_depth(m, order[s]) < kz) {
+        while (s >= 0 && fdepth[order[s]] < kz) {
             order[s + 1] = order[s];
             --s;
         }
@@ -395,7 +486,10 @@ void draw_piece(unsigned char f, unsigned char r, unsigned char pc)
         }
         poly_fill(xs, ys, fc->n, face_fill[black != 0][fc->shade]);
         for (k = 0; k < fc->n; ++k) {
-            unsigned char k2 = (unsigned char)((k + 1) % fc->n);
+            unsigned char k2 = (unsigned char)(k + 1);
+
+            if (k2 == fc->n)
+                k2 = 0;               /* wrap: avoids a % per edge */
             gfx_line(xs[k], ys[k], xs[k2], ys[k2], stroke);
         }
     }

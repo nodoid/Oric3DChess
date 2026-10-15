@@ -9,10 +9,13 @@
  *            U  undo        N  new game
  *            C  toggle computer opponent
  *            L  cycle search level (1 fast / 2 strong / 3 expert)
+ *            S  save game to tape    R  restore game from tape
  */
+#include <string.h>
 #include "engine.h"
 #include "gfx.h"
 #include "kbd.h"
+#include "tape.h"
 
 /* HUD rows (each text row is 8 pixels tall) */
 #define HUD_TURN 0
@@ -32,6 +35,26 @@ static signed char game_state;    /* 0 on, 1 white wins, 2 black wins, 3 draw */
 
 static char line[20];
 static unsigned char linelen;
+
+/* --- tape save/restore ------------------------------------------------
+ * One fixed-size block so the saved range never depends on hlen:
+ * Position + full history arrays + settings + magic/version + CRC16. */
+#define SAVE_MAGIC (0x4300 | 4) /* "C3" + layout version             */
+#define SAVE_SIZE (sizeof(Position) + sizeof hmove + sizeof hun + 4 + 2 + 2)
+static unsigned char savbuf[SAVE_SIZE];
+
+static unsigned crc16(const unsigned char *p, unsigned n)
+{
+    unsigned c = 0xFFFF;
+    unsigned i;
+
+    while (n--) {
+        c = (unsigned)(c ^ ((unsigned)*p++ << 8));
+        for (i = 0; i < 8; ++i)
+            c = (unsigned)((c & 0x8000) ? (c << 1) ^ 0x1021 : c << 1);
+    }
+    return c;
+}
 
 static void status(const char *s)
 {
@@ -57,7 +80,7 @@ static void draw_hud(void)
     }
 
     gfx_box(0, HUD_HINT, 239, HUD_HINT + 7, FILL_B);
-    gfx_text(0, HUD_HINT, "U UNDO  N NEW  C CPU  L LEVEL", 1);
+    gfx_text(0, HUD_HINT, "U UNDO N NEW C CPU L LEVEL S SAVE R LOAD", 1);
 
     gfx_box(0, HUD_PROMPT, 239, HUD_PROMPT + 7, FILL_B);
     gfx_text(0, HUD_PROMPT, ">", 1);
@@ -216,6 +239,72 @@ static void exec_line(void)
         status("LEVEL 1 FAST / 2 STRONG / 3 EXPERT");
         redraw();
         break;
+    case 's':
+    {
+        unsigned char *q = savbuf;
+        unsigned c;
+
+        memcpy(q, &pos, sizeof pos);
+        q += sizeof pos;
+        memcpy(q, hmove, sizeof hmove);
+        q += sizeof hmove;
+        memcpy(q, hun, sizeof hun);
+        q += sizeof hun;
+        *q++ = hlen;
+        *q++ = vs_computer;
+        *q++ = ai_depth;
+        *q++ = (unsigned char)game_state;
+        *q++ = (unsigned char)(SAVE_MAGIC & 0xFF);
+        *q++ = (unsigned char)(SAVE_MAGIC >> 8);
+        c = crc16(savbuf, (unsigned)(q - savbuf));
+        *q++ = (unsigned char)(c & 0xFF);
+        *q++ = (unsigned char)(c >> 8);
+
+        status("SAVING TO TAPE...");
+        tape_save("CHESS3D", savbuf, (unsigned)SAVE_SIZE);
+        status("GAME SAVED");
+        break;
+    }
+    case 'r':
+    {
+        unsigned ok = 0;
+
+        status("LOADING FROM TAPE...");
+        if (tape_load("CHESS3D", savbuf, (unsigned)SAVE_SIZE)) {
+            unsigned c = crc16(savbuf, SAVE_SIZE - 2);
+            unsigned want = (unsigned)savbuf[SAVE_SIZE - 2] |
+                            ((unsigned)savbuf[SAVE_SIZE - 1] << 8);
+            unsigned mag = (unsigned)savbuf[sizeof(Position) +
+                            sizeof hmove + sizeof hun + 2] |
+                            ((unsigned)savbuf[sizeof(Position) +
+                             sizeof hmove + sizeof hun + 3] << 8);
+
+            if (mag == SAVE_MAGIC && c == want) {
+                const unsigned char *q = savbuf;
+
+                memcpy(&pos, q, sizeof pos);
+                q += sizeof pos;
+                memcpy(hmove, q, sizeof hmove);
+                q += sizeof hmove;
+                memcpy(hun, q, sizeof hun);
+                q += sizeof hun;
+                hlen = *q++;
+                vs_computer = *q++;
+                ai_depth = *q++;
+                game_state = (signed char)*q;
+                linelen = 0;
+                ok = 1;
+            }
+        }
+        if (ok) {
+            redraw(); /* the ROM prints on screen during the load */
+            post_move();
+            status("GAME LOADED");
+        } else {
+            status("NO VALID SAVE ON TAPE");
+        }
+        break;
+    }
     default:
         status("U N C L OR MOVE E2E4");
         break;
