@@ -1,10 +1,15 @@
 /*
  * kbd.c - Oric keyboard matrix scan.
  *
- * Protocol follows the OSDK Keyboard-FullMatrix reference:
- *   - select AY register 14 once (portA=14, PCR=$FF then $DD)
- *   - for each row: write 0 to reg14, put row in PB0-2, test PB3
- *   - per column: write ~column mask to reg14, reselect row, test PB3
+ * Protocol matches the Atmos ROM's own ReadKbdCol ($F561):
+ *   - AY port A (register 14) drives the 8 column lines
+ *   - VIA PB0-2 select the row, VIA PB3 is the key-down sense line
+ *   - the AY register write uses the ROM's exact PCR bus sequence
+ *     ($F590): BDIR = CB2, BC1 = CA2; $EE = latch address,
+ *     $EC = write data, $CC = idle.  Earlier code pulsed $FF/$DD,
+ *     which on a real 6522 never enters the write state, so reg14
+ *     was never updated and no key was ever seen (verified under
+ *     Oricutron, which implements the VIA/AY faithfully).
  * Key-down is edge detected between calls; shift selects the upper table.
  */
 #include "kbd.h"
@@ -27,67 +32,84 @@
 #define K_ESC 0x1B
 
 /*
- * Keymaps indexed by row*8 + col, col0 = matrix bit7 (as in the OSDK
- * reference).  Lowercase table for unshifted, uppercase for shift.
+ * Keymaps indexed by row*8 + col.  Column c is selected by driving
+ * AY port B bit c low (mask ~(1<<c)); this matches the ROM's own
+ * FindKey mask chain ($7F/$BF/$DF/$EF/$F7/$FB/$FD/$FE pairs with
+ * col7..col0 in its column-major table) and Oricutron's qwktab.
+ * The earlier bit7-first scheme read every column mirrored, so
+ * e.g. ESC echoed 'r' and '2' echoed '^' (verified live).
+ * Digit/punct split follows the ROM KeyCodeTab: digits unshifted,
+ * &%^ etc. shifted.  Lowercase table for unshifted, uppercase for
+ * shift.
  */
 static const unsigned char key_lower[64] = {
-    '&', 'n', '%', 'v', K_CTRL, '!', 'x', '#',
+    '7', 'n', '5', 'v', K_CTRL, '1', 'x', '3',
     'j', 't', 'r', 'f', 0, K_ESC, 'q', 'd',
-    'm', '^', 'b', '$', K_CTRL, 'z', '@', 'c',
-    'k', '(', ';', '_', 0, 0, '\\', '\'',
-    ' ', '<', '>', K_UP, K_LSHIFT, K_LEFT, K_DOWN, K_RIGHT,
+    'm', '6', 'b', '4', K_CTRL, 'z', '2', 'c',
+    'k', '9', ';', '-', 0, 0, '\\', '\'',
+    ' ', ',', '.', K_UP, K_LSHIFT, K_LEFT, K_DOWN, K_RIGHT,
     'u', 'i', 'o', 'p', K_FUNCT, 0x08, ']', '[',
     'y', 'h', 'g', 'e', 0, 'a', 's', 'w',
-    '*', 'l', ')', '|', K_RSHIFT, 0x0D, 0, '='
+    '8', 'l', '0', '/', K_RSHIFT, 0x0D, 0, '='
 };
 
 static const unsigned char key_upper[64] = {
-    '7', 'N', '5', 'V', K_CTRL, '1', 'X', '3',
+    '&', 'N', '%', 'V', K_CTRL, '!', 'X', '#',
     'J', 'T', 'R', 'F', 0, K_ESC, 'Q', 'D',
-    'M', '6', 'B', '4', K_CTRL, 'Z', '2', 'C',
-    'K', '9', ';', '-', 0, 0, '\\', '\'',
-    ' ', ',', '.', K_UP, K_LSHIFT, K_LEFT, K_DOWN, K_RIGHT,
-    'U', 'I', 'O', 'P', K_FUNCT, 0x08, ']', '[',
+    'M', '^', 'B', '$', K_CTRL, 'Z', '@', 'C',
+    'K', '(', ';', '_', 0, 0, '|', '"',
+    ' ', '<', '>', K_UP, K_LSHIFT, K_LEFT, K_DOWN, K_RIGHT,
+    'U', 'I', 'O', 'P', K_FUNCT, 0x08, '}', '{',
     'Y', 'H', 'G', 'E', 0, 'A', 'S', 'W',
-    '8', 'L', '0', '\\', K_RSHIFT, 0x0D, 0, '='
+    '*', 'L', ')', '?', K_RSHIFT, 0x0D, 0, '+'
 };
 
 static unsigned char prev[8];
+
+/* AY-3-8912 register write, ROM-exact bus protocol ($F590). */
+static void ay_write(unsigned char reg, unsigned char val)
+{
+    unsigned char p = VIA_PCR;
+
+    VIA_PORTA = reg;
+    VIA_PCR = (unsigned char)(p | 0xEE);           /* latch address */
+    VIA_PCR = (unsigned char)((p & 0x11) | 0xCC);  /* idle          */
+    VIA_PORTA = val;
+    VIA_PCR = (unsigned char)((p & 0x11) | 0xEC);  /* write data    */
+    VIA_PCR = (unsigned char)((p & 0x11) | 0xCC);  /* idle          */
+}
 
 void kbd_init(void)
 {
     VIA_DDRA = 0xFF;       /* port A = output (PSG data)      */
     VIA_DDRB = 0xF7;       /* PB0-2 out (row), PB3 in (sense) */
-    VIA_PORTB = 0x00;
-    VIA_PORTA = 0x0E;      /* select PSG register 14          */
-    VIA_PCR = 0xFF;
-    VIA_PCR = 0xDD;
+    VIA_PORTB = 0xB8;      /* idle rows, AY control lines set */
+    ay_write(0x0E, 0x00);  /* all column lines low            */
 }
 
 static void scan(unsigned char *cur)
 {
-    unsigned char row, bit, v;
+    unsigned char row, bit, col, v;
 
     for (row = 0; row < 8; ++row)
         cur[row] = 0;
 
     for (row = 0; row < 8; ++row) {
         /* all columns low: is any key down in this row? */
-        VIA_PORTA = 0x00;
-        VIA_PCR = 0xFD;
-        VIA_PCR = 0xDD;
-        VIA_PORTB = (unsigned char)((VIA_PORTB & 0xF8) | row);
+        ay_write(0x0E, 0x00);
+        VIA_PORTB = (unsigned char)(row | 0xB8);
         /* cc65 CSEs a single volatile re-read after the RMW above (it tests
          * the stale sense bit), so read twice like the column loop does. */
         v = VIA_PORTB;
         v = VIA_PORTB;
         if ((v & 0x08) == 0)
             continue;
-        for (bit = 0x80; bit; bit = (unsigned char)(bit >> 1)) {
-            VIA_PORTA = (unsigned char)~bit;
-            VIA_PCR = 0xFD;
-            VIA_PCR = 0xDD;
-            VIA_PORTB = (unsigned char)((VIA_PORTB & 0xF8) | row);
+        for (bit = 0x80, col = 0x01; bit;
+             bit = (unsigned char)(bit >> 1),
+             col = (unsigned char)(col << 1)) {
+            /* table col c <-> AY column bit c (mask ~(1<<c)) */
+            ay_write(0x0E, (unsigned char)~col);
+            VIA_PORTB = (unsigned char)(row | 0xB8);
             v = VIA_PORTB;
             v = VIA_PORTB; /* settle */
             if (v & 0x08)

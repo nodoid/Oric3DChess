@@ -57,7 +57,12 @@ void gfx_clear(void)
     unsigned char *p = SCR;
     int i;
 
-    for (i = 8000; i; --i)
+    /* Clear the whole $A000-$BFFF block, not just the 8000 pixel
+       bytes: the ULA keeps displaying from the tail ($BF68+, the
+       "32 byte hole") for the last screen lines, and BASIC leaves
+       space characters there that would show up as vertical stripes
+       below the prompt. */
+    for (i = 8192; i; --i)
         *p++ = 0x40;
 }
 
@@ -70,6 +75,35 @@ void gfx_init(void)
         bit6[x] = (unsigned char)(0x20 >> (x - 6 * div6[x]));
     }
     gfx_clear();
+
+    /* Switch the ULA into 50 Hz hi-res mode.  The Oric has no mode
+       register: the display mode is a software attribute in the text
+       screen stream.  The ROM's own HIRES command ($F920 in BASIC 1.1B)
+       writes attribute 30 to $BFDF, the last byte (column 39) of the
+       last text line, which turns every displayed line into hi-res.
+       Do the same here so a fresh CLOAD+RUN shows the board instead
+       of the default 40x28 text screen.
+
+       The CRTC still scans 28 character rows, and emulators such as
+       Oricutron keep displaying rows 25-27 below the 200 hi-res
+       lines as *text* rows fed from $BF68-$BFE0 - rendered with the
+       hi-res RAM charset at $9800, which is uninitialized garbage.
+       Space characters there turn into a band of stripes under the
+       HUD (the ROM's own HIRES shows the same in Oricutron).  Fill
+       the tail with attribute bytes instead: any byte with bits 6+5
+       clear decodes as a serial attribute, so 0x00 = "foreground
+       colour 0, data 0" renders a solid black block on every one of
+       those rows.  Attribute 30 at $BFDF (end of line 27, read later
+       in the beam order) switches the *next* frame back to hi-res,
+       so the main display stays hi-res. */
+    {
+        unsigned char *p;
+
+        for (p = (unsigned char *)0xBF40;
+             p < (unsigned char *)0xBFDF; ++p)
+            *p = 0x00;              /* serial attribute: black block   */
+        *((unsigned char *)0xBFDF) = 30;  /* line 27 end: HIRES next frame*/
+    }
 }
 
 void gfx_px(int x, int y)
